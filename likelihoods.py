@@ -20,16 +20,14 @@ class DynamicCovarianceBaseLikelihood(likelihoods.Likelihood):
             constructed covariance matrix.
         :param cov_dim: int - Will not be exposed to the user
         :param nu: int - Will not be exposed to user
-        :param full_cov: boolean -
-        :param n_factors: int -
         :param n_mc_samples: int - Number of Monte Carlo samples used to approximate the reparameterized gradients.
-        :param full_scale: boolean -
-        :param approx_wishart: boolean -
-        :param sigma: float - if approx_wishart==True, this is the initial value of the additional noise parameter.
+        :param model_inverse: boolean - If True, use the inverse Wishart process, otherwise, the Wishart process.
+        :param heavy_tail: boolean - If True, use the multivariate-t emission distribution, otherwise, use the Gaussian.
+        :param dof: float; optional initial value for degrees of freedom parameter for a multivariate-t emission
+            distribution. This is ignored if heavy_tail==False.
         """
         super().__init__()
         self.n_mc_samples = n_mc_samples
-        # self.n_mc_samples = tf.placeholder(dtype=tf.int32, shape=[], name='n_mc_samples')
 
         self.D = D
         self.cov_dim = cov_dim
@@ -118,10 +116,9 @@ class FullCovLikelihood(DynamicCovarianceBaseLikelihood):
         :param heavy_tail: bool - If True, use the multivariate-t distribution emission model.
         :param model_inverse: bool - If True, we are modeling the inverse of the Covariance matrix with a Wishart
             distribution, i.e., this corresponds to an inverse Wishart process model.
-        :param approx_wishart: bool - If True, use the approximately Wishart distributed model utilizing an additional
-            diagonal noise parameter in the covariance matrix.
-        :param dof: float - If 'heavy_tail' is True, then this is used to initialize the multivariate-t distribution
-            degrees of freedom parameter, otherwise, it is ignored.
+        :param approx_wishart: bool - If True, use the additive noise model.
+        :param nu:
+        :param dof:
         """
         nu = D if nu is None else nu
         if nu < D:
