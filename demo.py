@@ -5,8 +5,8 @@ import numpy as np
 import gpflow
 import gpflow.training.monitor as gpmon
 
-from .models import FullCovarianceRegression, FactoredCovarianceRegression, LoglikelTensorBoardTask
-from .likelihoods import FullCovLikelihood, FactoredCovLikelihood
+from models import FullCovarianceRegression, FactoredCovarianceRegression, LoglikelTensorBoardTask
+from likelihoods import FullCovLikelihood, FactoredCovLikelihood
 
 
 ### Run this as a script
@@ -159,14 +159,49 @@ with gpmon.Monitor(monitor_tasks, session, global_step, print_summary=True) as m
 
 # the format of the predictions depends on whether you're using a factored model; see the definitions in 'models'
 if not factored:
-    preds = model.map_predict(X_test)
-    preds_json = dict(pred_mat=[preds[t, :, :].tolist() for t in range(preds.shape[0])])
+    preds = model.predict(X_test)
+
+    # look at the parameters in the dictionary 'preds':
+    print("Parameters required for prediction:", preds.keys())
+
+    # form Monte Carlo samples of the the predicted matrix like:
+    mu, s2 = preds['mu'], preds['s2']  # (N_test, D, nu)
+    N_test, D, nu = mu.shape
+    F_samps = np.random.randn(n_samples, N_test, D, nu) * (s2 ** 0.5) + mu  # (n_samples, N_test, D, nu)
+    AF = preds['scale_diag'][:, None] * F_samps  # (n_samples, N_test, D, nu)
+    affa = np.matmul(AF, np.transpose(AF, [0, 1, 3, 2]))  # (n_samples, N_test, D, D)
+
+    if not approx_wishart:
+        additive_part = np.diag(np.ones(D) * 1e-5)[None, :, :]  # at least add some small jitter, like with normal GPs
+    else:
+        sigma2inv_conc = preds['sigma2inv_conc']  # (D,)
+        sigma2inv_rate = preds['sigma2inv_rate']
+        sigma2inv_samps = np.random.gamma(sigma2inv_conc, scale=1.0 / sigma2inv_rate, size=[n_samples, D])  # (n_samples, D)
+
+        if model_inverse:
+            # inverse Wishart process variants
+            additive_part = np.apply_along_axis(np.diag, axis=1, arr=sigma2inv_samps)  # (n_samples, D, D)
+        else:
+            # Wishart process variants
+            additive_part = np.apply_along_axis(np.diag, axis=1, arr=sigma2inv_samps ** -1.0)  # (n_samples, D, D)
+
+    affa = affa + additive_part[:, None, :, :]  # shape: (n_samples, N_test, D, D)
 
 else:
-    sigma2, scale, F = model.map_predict(X_test)
-    preds_json = dict(F=F.tolist(), scale=scale.tolist(), sigma2=sigma2.tolist())
+    preds = model.predict(X_test)
 
+    # look at the parameters in the dictionary 'preds':
+    print("Parameters required for prediction:", preds.keys())
+
+    # In this case, you're probably using a factored model because you can't/shouldn't be representing the full
+    # covariance matrix. You can form Monte Carlo samples of the required parameters/variables (to use in evaluating
+    # a test loglikelihood, for example) as in the above example.
+
+
+for key in preds.keys():
+    if isinstance(preds[key], np.ndarray):
+        preds[key] = preds[key].tolist()
 
 # save predictions in json format
 with open(os.path.join(root_savedir, 'preds.json'), 'w') as f:
-    json.dump(preds_json, f)
+    json.dump(preds, f)

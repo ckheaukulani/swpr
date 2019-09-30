@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.special import logsumexp
 import tensorflow as tf
 
 from gpflow import settings
@@ -14,18 +15,18 @@ class DynamicCovarianceRegression(SVGP):
     def __init__(self, X, Y, kern, likelihood, Z, minibatch_size=None, whiten=True):
         """
 
-        :param X: (N, 1)-array of inputs (time)
-        :param Y: (N, D)-array of measurements
-        :param kern: GPflow kernel object
-        :param likelihood: GPflow likelihood object
-        :param Z: (M, D)-array of initial
+        :param X:
+        :param Y:
+        :param kern:
+        :param likelihood:
+        :param Z:
         :param minibatch_size:
         :param whiten:
         """
         cov_dim = likelihood.cov_dim
         nu = likelihood.nu
 
-        # X and Y are the training dataset, subtract mean and save for prediction time
+        # X and Y are the training dataset, demean and save for prediction time
         Y_mean = np.mean(Y, axis=0)  # (D,)
         Y = Y - Y_mean  # (N, D)
 
@@ -40,7 +41,7 @@ class DynamicCovarianceRegression(SVGP):
                          name='SVGP')  # must provide a name space when delaying build for GPflow opt functionality
 
         self.compile()  # if I don't compile now then there's a weird error when trying to construct the prediction
-        self.Y_mean = Y_mean  # used when constructing the predictive densities
+        self.Y_mean = Y_mean  # used when constructing the predictions
         self.construct_predictive_density()
 
     @params_as_tensors
@@ -48,24 +49,27 @@ class DynamicCovarianceRegression(SVGP):
         D = self.likelihood.D
         self.X_new = tf.placeholder(dtype=settings.float_type, shape=[None, 1])
         self.Y_new = tf.placeholder(dtype=settings.float_type, shape=[None, D])
+        self.n_samples = tf.placeholder(dtype=settings.int_type, shape=[])
 
-        # subtract TRAINING mean
+        # demean
         Y_new = self.Y_new - self.Y_mean
 
-        F, _ = self._build_predict(self.X_new)  # (N_new, num_latent); e.g., num_latent = D * nu
-        N_new = tf.shape(F)[0]
+        F_mean, F_var = self._build_predict(self.X_new)  # (N_new, num_latent); e.g., num_latent = D * nu
+        N_new = tf.shape(F_mean)[0]
         cov_dim = self.likelihood.cov_dim
-        self.F_mu_new = tf.reshape(F, [N_new, cov_dim, -1])  # (N_new, cov_dim, nu)
-        log_det_cov, yt_inv_y = self.likelihood.make_gaussian_components(self.F_mu_new[None, :, :, :], Y_new)
-        log_det_cov = tf.squeeze(log_det_cov)  # squeezes out the leading singleton dimension
-        yt_inv_y = tf.squeeze(yt_inv_y)
+        self.F_mean_new = tf.reshape(F_mean, [N_new, cov_dim, -1])  # (N_new, cov_dim, nu)
+        self.F_var_new = tf.reshape(F_var, [N_new, cov_dim, -1])
 
-        # compute the Gaussian metrics (regardless of emission distribution)
+        nu = tf.shape(self.F_mean_new)[-1]
+        F_samps = tf.random.normal([self.n_samples, N_new, cov_dim, nu], dtype=settings.float_type) \
+                  * (self.F_var_new ** 0.5) + self.F_mean_new
+        log_det_cov, yt_inv_y = self.likelihood.make_gaussian_components(F_samps, Y_new)
+
+        # compute the Gaussian metrics
         D_ = tf.cast(self.likelihood.D, settings.float_type)
-        self.logp_gauss_data = - 0.5 * yt_inv_y  # this will be terms depending only on the data
+        self.logp_gauss_data = - 0.5 * yt_inv_y
         self.logp_gauss = - 0.5 * D_ * np.log(2 * np.pi) - 0.5 * log_det_cov + self.logp_gauss_data  # (S, N)
 
-        # compute loglikelihood under the appropriate emission distribution
         if not self.likelihood.heavy_tail:
             self.logp_data = self.logp_gauss_data
             self.logp = self.logp_gauss
@@ -75,11 +79,12 @@ class DynamicCovarianceRegression(SVGP):
             self.logp = tf.lgamma(0.5 * (dof + D_)) - tf.lgamma(0.5 * dof) - 0.5 * D_ * tf.log(np.pi * dof) \
                         - 0.5 * log_det_cov + self.logp_data  # (S, N)
 
-    def map_predict_density(self, X_new, Y_new):
+    def mcmc_predict_density(self, X_new, Y_new, n_samples=100):
         sess = self.enquire_session()
-        return sess.run([self.logp, self.logp_data, self.logp_gauss, self.logp_gauss_data],
-                        feed_dict={self.X_new: X_new, self.Y_new: Y_new})
-
+        outputs = sess.run([self.logp, self.logp_data, self.logp_gauss, self.logp_gauss_data],
+                           feed_dict={self.X_new: X_new, self.Y_new: Y_new, self.n_samples: n_samples})
+        log_S = np.log(n_samples)
+        return tuple(map(lambda x: logsumexp(x, axis=0) - log_S, outputs))
 
 class FullCovarianceRegression(DynamicCovarianceRegression):
     @params_as_tensors
@@ -92,33 +97,42 @@ class FullCovarianceRegression(DynamicCovarianceRegression):
             KL += self.KL_gamma
         return KL
 
-    def map_predict(self, X_new):
-        """
-        Predict either the covariance matrix (in the Wishart process case) or precision matrix (in the inverse Wishart
-        process case).
+    def mcmc_predict_matrix(self, X_new, n_samples):
 
-        :param X_new:
-        :return:
-        """
-        sess = self.enquire_session()
-        F = sess.run(self.F_mu_new, feed_dict={self.X_new: X_new})  # (N_new, D, nu)
+        params = self.predict(X_new)
+        mu, s2 = params['mu'], params['s2']
+        scale_diag = params['scale_diag']
 
-        # grab other required params
-        scale_diag = self.likelihood.scale_diag.read_value(sess)
-
-        # it's probably cleanest to just recompute here in numpy
-        AF = scale_diag[:, None] * F  # (N, D, nu)
-        affa = np.matmul(AF, np.transpose(AF, [0, 2, 1]))  # (N, D, D)
+        N_new, D, nu = mu.shape
+        F_samps = np.random.randn(n_samples, N_new, D, nu) * np.sqrt(s2) + mu  # (n_samples, N_new, D, nu)
+        AF = scale_diag[:, None] * F_samps  # (n_samples, N_new, D, nu)
+        affa = np.matmul(AF, np.transpose(AF, [0, 1, 3, 2]))  # (n_samples, N_new, D, D)
 
         if self.likelihood.approx_wishart:
-            sigma2inv = self.likelihood.q_sigma2inv_conc.read_value(sess) / self.likelihood.q_sigma2inv_rate.read_value(sess)
-            sigma2 = sigma2inv ** -1.0
+            sigma2inv_conc = params['sigma2inv_conc']
+            sigma2inv_rate = params['sigma2inv_rate']
+            sigma2inv_samps = np.random.gamma(sigma2inv_conc, scale=1.0 / sigma2inv_rate, size=[n_samples, D])  # (n_samples, D)
+
             if self.likelihood.model_inverse:
-                affa = affa + np.diag(sigma2 ** -1.0)
+                lam = np.apply_along_axis(np.diag, axis=0, arr=sigma2inv_samps)  # (n_samples, D, D)
             else:
-                affa = affa + np.diag(sigma2)
+                lam = np.apply_along_axis(np.diag, axis=0, arr=sigma2inv_samps ** -1.0)
+            affa = affa + lam[:, None, :, :]  # (n_samples, N_new, D, D)
         return affa
 
+    def predict(self, X_new):
+
+        sess = self.enquire_session()
+        mu, s2 = sess.run([self.F_mean_new, self.F_var_new], feed_dict={self.X_new: X_new})  # (N_new, D, nu), (N_new, D, nu)
+        scale_diag = self.likelihood.scale_diag.read_value(sess)  # (D,)
+        params = dict(mu=mu, s2=s2, scale_diag=scale_diag)
+
+        if self.likelihood.approx_wishart:
+            sigma2inv_conc = self.likelihood.q_sigma2inv_conc.read_value(sess)  # (D,)
+            sigma2inv_rate = self.likelihood.q_sigma2inv_rate.read_value(sess)
+            params.update(dict(sigma2inv_conc=sigma2inv_conc, sigma2inv_rate=sigma2inv_rate))
+
+        return params
 
 class FactoredCovarianceRegression(DynamicCovarianceRegression):
     @params_as_tensors
@@ -130,10 +144,10 @@ class FactoredCovarianceRegression(DynamicCovarianceRegression):
         KL += self.KL_gamma
         return KL
 
-    def map_predict(self, X_new):
+    def predict(self, X_new):
         """
         Compute the components needed for prediction: s2_diag, scale, F. It's more efficient to report this since scale
-         is (D, K) and F is (T_test, K, K).
+        is (D, K) and F is (T_test, K, K).
 
         In the Wishart process case, we construct the covariance matrix as:
             S = np.diag(s2_diag) + U * U^T
@@ -148,12 +162,15 @@ class FactoredCovarianceRegression(DynamicCovarianceRegression):
         :param X_new:
         :return:
         """
+
         sess = self.enquire_session()
-        F = sess.run(self.F_mu_new, feed_dict={self.X_new: X_new})  # (N_new, K, nu)
-        scale = self.likelihood.scale.read_value(sess)  # (D, K)
-        sigma2inv = self.likelihood.q_sigma2inv_conc.read_value(sess) / self.likelihood.q_sigma2inv_rate.read_value(sess)
-        sigma2 = sigma2inv ** -1.0
-        return sigma2, scale, F
+        mu, s2 = sess.run([self.F_mean_new, self.F_var_new], feed_dict={self.X_new: X_new})  # (N_new, D, nu), (N_new, D, nu)
+        scale = self.likelihood.scale.read_value(sess)  # (D, Kv)
+
+        sigma2inv_conc = self.likelihood.q_sigma2inv_conc.read_value(sess)  # (D,)
+        sigma2inv_rate = self.likelihood.q_sigma2inv_rate.read_value(sess)
+        params = dict(mu=mu, s2=s2, scale=scale, sigma2inv_conc=sigma2inv_conc, sigma2inv_rate=sigma2inv_rate)
+        return params
 
 
 ###########################################
@@ -161,8 +178,7 @@ class FactoredCovarianceRegression(DynamicCovarianceRegression):
 ###########################################
 
 
-def get_loglikel(model, Xt, Yt):
-    minibatch_size = 100
+def get_loglikel(model, Xt, Yt, minibatch_size=100):
     loglikel_ = 0.0
     loglikel_data_ = 0.0
     gauss_ll_ = 0.0
@@ -172,7 +188,7 @@ def get_loglikel(model, Xt, Yt):
         mb_finish = (mb + 1) * minibatch_size
         Xt_mb = Xt[mb_start:mb_finish, :]
         Yt_mb = Yt[mb_start:mb_finish, :]
-        logp, logp_data, logp_gauss, logp_gauss_data = model.map_predict_density(Xt_mb, Yt_mb)  # (N_new,), (N_new,)
+        logp, logp_data, logp_gauss, logp_gauss_data = model.mcmc_predict_density(Xt_mb, Yt_mb)  # (N_new,), (N_new,)
         loglikel_ += np.sum(logp)  # simply summing over the log p(Y_n, X_n | F_n^)
         loglikel_data_ += np.sum(logp_data)
         gauss_ll_ += np.sum(logp_gauss)
